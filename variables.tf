@@ -12,7 +12,7 @@ variable "github_repository" {
 variable "state_passphrase" {
   type        = string
   sensitive   = true
-  description = "Passphrase for state and plan encryption. At least 16 characters. The host workflow sets TF_VAR_state_passphrase from the secret its caller passes in. OpenTofu reads TF_VAR_<name> from the environment."
+  description = "Passphrase for state and plan encryption. At least 16 characters. The host workflow sets TF_VAR_state_passphrase from the repository secret TF_STATE_PASSPHRASE. OpenTofu reads TF_VAR_<name> from the environment."
 
   validation {
     condition     = length(var.state_passphrase) >= 16

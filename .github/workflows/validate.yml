@@ -1,5 +1,6 @@
-# Pull requests in the factory repository. fmt and validate only.
-# There is no backend and no state: this repo never applies.
+# Pull requests in the factory repository.
+# fmt and validate the OpenTofu here. actionlint checks .github/workflows
+# and github/workflows. There is no backend and no state: this repo never applies.
 
 name: Validate
 
@@ -11,7 +12,7 @@ permissions:
 
 jobs:
   validate:
-    name: Format and validate
+    name: Format, validate, and lint
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -46,3 +47,23 @@ jobs:
             find . -path './.terraform' -prune -o -type f \( -name '*.tfstate' -o -name '*.tfstate.*' \) -print
             exit 1
           fi
+
+      # actionlint's own release, pinned. Shellcheck runs too when the
+      # runner has it, which GitHub-hosted Ubuntu images do.
+      - name: Lint workflows
+        run: |
+          set -euo pipefail
+          version=1.7.12
+          case "$(uname -m)" in
+            x86_64) platform=linux_amd64 ;;
+            aarch64|arm64) platform=linux_arm64 ;;
+            *)
+              echo "No actionlint build for $(uname -m)."
+              exit 1
+              ;;
+          esac
+          archive="actionlint_${version}_${platform}.tar.gz"
+          tmp="$(mktemp -d)"
+          curl -fsSL -o "${tmp}/${archive}" "https://github.com/rhysd/actionlint/releases/download/v${version}/${archive}"
+          tar -xzf "${tmp}/${archive}" -C "$tmp" actionlint
+          "$tmp/actionlint" -color .github/workflows/*.yml github/workflows/*.yml
