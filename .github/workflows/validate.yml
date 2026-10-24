@@ -1,0 +1,69 @@
+# Pull requests in the factory repository.
+# fmt and validate the OpenTofu here. actionlint checks .github/workflows
+# and github/workflows. There is no backend and no state: this repo never applies.
+
+name: Validate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Format, validate, and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TF_IN_AUTOMATION: "1"
+      # init has to build the encryption block, which needs a passphrase.
+      # -backend=false means this value is never used to read or write state.
+      TF_VAR_state_passphrase: "validate-only-placeholder"
+      TF_VAR_github_repository: "owner/name"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenTofu 1.13.2
+        uses: opentofu/setup-opentofu@v2.0.2
+        with:
+          tofu_version: "1.13.2"
+          tofu_wrapper: false
+
+      - name: Check formatting
+        run: tofu fmt -check -recursive -diff
+
+      - name: Init without a backend, then validate
+        run: |
+          set -euo pipefail
+          tofu init -backend=false -input=false
+          tofu validate
+          # .terraform/ is the provider cache. A state file anywhere else
+          # would mean this job touched the backend.
+          if find . -path './.terraform' -prune -o -type f \( -name '*.tfstate' -o -name '*.tfstate.*' \) -print | grep -q .; then
+            echo "validate wrote a state file. This repository does not keep state."
+            find . -path './.terraform' -prune -o -type f \( -name '*.tfstate' -o -name '*.tfstate.*' \) -print
+            exit 1
+          fi
+
+      # actionlint's own release, pinned. Shellcheck runs too when the
+      # runner has it, which GitHub-hosted Ubuntu images do.
+      - name: Lint workflows
+        run: |
+          set -euo pipefail
+          version=1.7.12
+          case "$(uname -m)" in
+            x86_64) platform=linux_amd64 ;;
+            aarch64|arm64) platform=linux_arm64 ;;
+            *)
+              echo "No actionlint build for $(uname -m)."
+              exit 1
+              ;;
+          esac
+          archive="actionlint_${version}_${platform}.tar.gz"
+          tmp="$(mktemp -d)"
+          curl -fsSL -o "${tmp}/${archive}" "https://github.com/rhysd/actionlint/releases/download/v${version}/${archive}"
+          tar -xzf "${tmp}/${archive}" -C "$tmp" actionlint
+          "$tmp/actionlint" -color .github/workflows/*.yml github/workflows/*.yml

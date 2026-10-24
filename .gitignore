@@ -1,0 +1,13 @@
+# Factory repository only. Hosts do not copy this file.
+# It is a safety net for anything OpenTofu can generate if someone
+# runs tofu in this checkout. .terraform.lock.hcl is committed.
+
+.terraform/
+**/.terraform/
+
+*.tfstate*
+*.tfplan
+*.tfplan.*
+
+crash.log
+crash.*.log
