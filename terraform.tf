@@ -1,9 +1,13 @@
-# OpenTofu settings for this stack.
+# OpenTofu settings for the label stack.
 #
-# Run every tofu command from infra/. The GitHub Actions workflow does.
-# State encryption needs OpenTofu 1.7 or newer. CI installs 1.13.2.
-# required_version stops an older CLI, which would not understand
-# the encryption block.
+# These files are copied into a host repository at .factory/, and tofu
+# runs with .factory/ as its working directory. This factory repository
+# does not apply them and does not keep a state file. Its CI runs
+# tofu init -backend=false, so the backend below is not used here.
+#
+# State encryption needs OpenTofu 1.7 or newer. The host workflow
+# installs 1.13.2. required_version stops an older CLI, which would
+# not understand the encryption block.
 
 terraform {
   required_version = ">= 1.13.2"
@@ -15,13 +19,11 @@ terraform {
     }
   }
 
-  # Local backend: one file on disk, no remote backend account.
-  # The path is relative to infra/. CI checks the tofu-state branch
-  # out at ../tofu-state before plan and apply. The file is created
-  # on the first apply. It is gitignored on main and committed only
-  # on that branch.
+  # Relative to the working directory. In a host that is .factory/,
+  # so the file on the host's main is .factory/state/terraform.tfstate.
+  # Nothing in this repository is shipped under state/.
   backend "local" {
-    path = "../tofu-state/labels.tfstate"
+    path = "state/terraform.tfstate"
   }
 
   # Encrypt state and plan files before they touch disk.
@@ -41,8 +43,7 @@ terraform {
     }
 
     # enforced refuses a plaintext file. There is no unencrypted
-    # fallback: this stack has never written plaintext state.
-    # The same rules apply to plan files.
+    # fallback. The same rules apply to plan files.
     state {
       method   = method.aes_gcm.default
       enforced = true

@@ -1,0 +1,48 @@
+# Pull requests in the factory repository. fmt and validate only.
+# There is no backend and no state: this repo never applies.
+
+name: Validate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Format and validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TF_IN_AUTOMATION: "1"
+      # init has to build the encryption block, which needs a passphrase.
+      # -backend=false means this value is never used to read or write state.
+      TF_VAR_state_passphrase: "validate-only-placeholder"
+      TF_VAR_github_repository: "owner/name"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenTofu 1.13.2
+        uses: opentofu/setup-opentofu@v2.0.2
+        with:
+          tofu_version: "1.13.2"
+          tofu_wrapper: false
+
+      - name: Check formatting
+        run: tofu fmt -check -recursive -diff
+
+      - name: Init without a backend, then validate
+        run: |
+          set -euo pipefail
+          tofu init -backend=false -input=false
+          tofu validate
+          # .terraform/ is the provider cache. A state file anywhere else
+          # would mean this job touched the backend.
+          if find . -path './.terraform' -prune -o -type f \( -name '*.tfstate' -o -name '*.tfstate.*' \) -print | grep -q .; then
+            echo "validate wrote a state file. This repository does not keep state."
+            find . -path './.terraform' -prune -o -type f \( -name '*.tfstate' -o -name '*.tfstate.*' \) -print
+            exit 1
+          fi

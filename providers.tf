@@ -1,5 +1,6 @@
 # github.repository looks like "octocat/hello-world": owner, slash, name.
 # The provider wants the owner. The label resource wants the name only.
+# In a host, github.repository is that host.
 
 locals {
   github_repository_parts = split("/", var.github_repository)
@@ -11,6 +12,6 @@ provider "github" {
   owner = local.github_owner
 
   # The token is the GITHUB_TOKEN environment variable.
-  # In GitHub Actions that is the built-in token for this repository.
+  # In the host workflow that is the host's built-in token.
   # No personal access token.
 }

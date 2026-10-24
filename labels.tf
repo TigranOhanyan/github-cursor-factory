@@ -1,4 +1,4 @@
-# Issue labels for one repository: the repository the workflow runs in.
+# Issue labels for the repository the host workflow runs in.
 #
 # Each label is its own github_issue_label. That resource adopts a label
 # that already exists (it looks the label up by name) and it leaves every
@@ -10,8 +10,8 @@
 #
 # These descriptions are written to stay true if a label is only ever
 # added to an issue and never removed. An issue can carry several of
-# them at once. Nothing in this repository attaches labels to issues;
-# it only makes sure the definitions exist.
+# them at once. The stack does not attach labels to issues. It only
+# makes sure the definitions exist.
 #
 # GitHub stores a description of at most 100 characters, and a color as
 # six hex digits with no leading "#".
