@@ -1,0 +1,243 @@
+# Creates and updates this repository's issue labels.
+#
+# Pull requests that change infra/ or this file: format, validate, and
+# (for a pull request opened from this repository) plan. The plan reads
+# encrypted state from the tofu-state branch and does not write it back.
+#
+# A push to main that changes infra/ or this file, and a manual run from
+# main: apply, then commit the encrypted state to the tofu-state branch.
+#
+# Two things keep that commit from starting another run. The push trigger
+# listens to main only, and only for the paths below, so a commit on
+# tofu-state does not match. A push made with GITHUB_TOKEN does not start
+# workflows either.
+
+name: Labels
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/labels.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "infra/**"
+      - ".github/workflows/labels.yml"
+  workflow_dispatch:
+
+# Plan and apply share one queue. An apply is not cancelled to make room
+# for the next run; the next run waits, so two applies never overlap.
+concurrency:
+  group: tofu-labels
+  cancel-in-progress: false
+
+# Jobs below grant their own token permissions. A job without a block
+# would get nothing.
+permissions: {}
+
+jobs:
+  fmt-and-validate:
+    name: Format and validate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_VAR_github_repository: ${{ github.repository }}
+      # Fork pull requests do not receive secrets. validate does not
+      # read or write state, so a placeholder is enough to load the
+      # encryption block. plan and apply do not use this fallback.
+      TF_VAR_state_passphrase: "${{ secrets.TF_STATE_PASSPHRASE || 'validate-only-placeholder' }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenTofu 1.13.2
+        uses: opentofu/setup-opentofu@v2.0.2
+        with:
+          tofu_version: "1.13.2"
+          tofu_wrapper: false
+
+      - name: Check formatting
+        working-directory: infra
+        run: tofu fmt -check -recursive -diff
+
+      - name: Init and validate
+        working-directory: infra
+        run: |
+          set -euo pipefail
+          mkdir -p ../tofu-state
+          tofu init -input=false
+          tofu validate
+
+  plan:
+    name: Plan
+    needs: fmt-and-validate
+    # secrets are not available on a pull request from a fork.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_VAR_github_repository: ${{ github.repository }}
+      TF_VAR_state_passphrase: ${{ secrets.TF_STATE_PASSPHRASE }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Install OpenTofu 1.13.2
+        uses: opentofu/setup-opentofu@v2.0.2
+        with:
+          tofu_version: "1.13.2"
+          tofu_wrapper: false
+
+      - name: Require state passphrase
+        run: |
+          set -euo pipefail
+          if [ -z "${TF_VAR_state_passphrase}" ]; then
+            echo "The TF_STATE_PASSPHRASE Actions secret is empty or missing."
+            echo "Add it before plan can run. See README, Manual setup."
+            exit 1
+          fi
+
+      - name: Checkout state branch (read-only)
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          # Second checkout, in ./tofu-state. Plan never commits or pushes.
+          # A missing branch means this repository has not been applied yet.
+          # Any other fetch failure (auth, network) stops the job.
+          fetch_err=$(mktemp)
+          if git fetch --depth=1 origin tofu-state 2>"$fetch_err"; then
+            git worktree add --force -B tofu-state tofu-state FETCH_HEAD
+          elif grep -q "couldn't find remote ref" "$fetch_err"; then
+            echo "No tofu-state branch yet. Planning against empty state."
+            mkdir -p tofu-state
+          else
+            cat "$fetch_err" >&2
+            echo "Failed to fetch the tofu-state branch." >&2
+            exit 1
+          fi
+
+      - name: Init and plan
+        working-directory: infra
+        run: |
+          set -euo pipefail
+          tofu init -input=false
+          tofu plan -input=false -no-color
+
+  apply:
+    name: Apply
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_VAR_github_repository: ${{ github.repository }}
+      TF_VAR_state_passphrase: ${{ secrets.TF_STATE_PASSPHRASE }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Install OpenTofu 1.13.2
+        uses: opentofu/setup-opentofu@v2.0.2
+        with:
+          tofu_version: "1.13.2"
+          tofu_wrapper: false
+
+      - name: Require state passphrase
+        run: |
+          set -euo pipefail
+          if [ -z "${TF_VAR_state_passphrase}" ]; then
+            echo "The TF_STATE_PASSPHRASE Actions secret is empty or missing."
+            echo "Add it before apply can run. See README, Manual setup."
+            exit 1
+          fi
+
+      - name: Checkout state branch
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          # Second checkout, in ./tofu-state. The first apply creates the
+          # orphan branch; later applies commit onto it. The worktree
+          # shares this job's GITHUB_TOKEN credentials.
+          # A missing branch is the first run. Any other fetch failure stops
+          # the job, so a network error cannot start a second orphan history.
+          fetch_err=$(mktemp)
+          if git fetch --depth=1 origin tofu-state 2>"$fetch_err"; then
+            git worktree add --force -B tofu-state tofu-state FETCH_HEAD
+          elif grep -q "couldn't find remote ref" "$fetch_err"; then
+            echo "No tofu-state branch yet. Starting an empty orphan branch."
+            git worktree add --orphan -b tofu-state tofu-state
+          else
+            cat "$fetch_err" >&2
+            echo "Failed to fetch the tofu-state branch." >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        working-directory: infra
+        run: tofu fmt -check -recursive -diff
+
+      - name: Init, validate, and apply
+        working-directory: infra
+        run: |
+          set -euo pipefail
+          tofu init -input=false
+          tofu validate
+          tofu apply -auto-approve -input=false -no-color
+
+      - name: Commit encrypted state to tofu-state
+        run: |
+          set -euo pipefail
+          cd tofu-state
+
+          if [ ! -f labels.tfstate ]; then
+            echo "OpenTofu did not write tofu-state/labels.tfstate."
+            exit 1
+          fi
+
+          # The state branch holds this file and nothing else.
+          # Leave backups and lock files untracked.
+          git add -- labels.tfstate
+
+          if git diff --cached --quiet; then
+            echo "Encrypted state is unchanged. Nothing to commit."
+            exit 0
+          fi
+
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "Update encrypted OpenTofu state for issue labels"
+
+          current="$(git branch --show-current)"
+          if [ "$current" != "tofu-state" ]; then
+            echo "Refusing to push: HEAD is '${current}', expected tofu-state."
+            exit 1
+          fi
+
+          git push origin HEAD:tofu-state

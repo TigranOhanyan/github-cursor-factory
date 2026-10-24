@@ -1,0 +1,32 @@
+# OpenTofu downloads providers into .terraform/. That cache is not the
+# infra/ code and is never committed. The lock file next to the code
+# (infra/.terraform.lock.hcl) is committed.
+
+.terraform/
+**/.terraform/
+
+# CI checks the tofu-state branch out here. It is a second working tree,
+# not part of main.
+
+/tofu-state/
+
+# State and plan files. Encrypted state is committed on the tofu-state
+# branch only. That branch is an orphan, so this ignore rule does not
+# apply there. On main, *.tfstate* stays ignored.
+
+*.tfstate*
+*.tfplan
+*.tfplan.*
+
+crash.log
+crash.*.log
+
+# A .tfvars file would be an easy place to leave a passphrase.
+
+*.tfvars
+*.tfvars.json
+
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
