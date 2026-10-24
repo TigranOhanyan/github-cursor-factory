@@ -20,7 +20,7 @@ terraform {
   }
 
   # Relative to the working directory. In a host that is .factory/,
-  # so the file on the host's main is .factory/state/terraform.tfstate.
+  # so the file on the host's default branch is .factory/state/terraform.tfstate.
   # Nothing in this repository is shipped under state/.
   backend "local" {
     path = "state/terraform.tfstate"

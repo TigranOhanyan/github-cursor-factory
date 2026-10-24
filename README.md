@@ -27,7 +27,7 @@ In a host repository:
 .factory/providers.tf
 .factory/labels.tf
 .factory/.terraform.lock.hcl
-.factory/state/terraform.tfstate      written by apply, committed on the host's main
+.factory/state/terraform.tfstate      written by apply, committed on the host's default branch
 .github/workflows/factory-labels.yml  caller; not part of .factory/
 ```
 
@@ -40,12 +40,12 @@ flowchart TD
   files["OpenTofu files at the factory root"] --> dotfactory["Host copies them into .factory/"]
   caller["Host adds factory-labels.yml"] --> called["labels.yml, workflow_call"]
   pr["Pull request in the host"] --> plan["plan"]
-  main["Push to the host's main, or Run workflow"] --> apply["apply"]
+  push["Push to the host's default branch, or Run workflow"] --> apply["apply"]
   caller --> pr
-  caller --> main
+  caller --> push
   called --> plan
   called --> apply
-  apply --> state["Commit .factory/state/terraform.tfstate on main"]
+  apply --> state["Commit .factory/state/terraform.tfstate on the default branch"]
 ```
 
 ## Labels
@@ -70,7 +70,7 @@ These descriptions are written as facts that stay true. The intended use is to a
 `labels.yml` is `on: workflow_call` only. It never runs on a push or a pull request in this repository. The host's `factory-labels.yml` decides when to call it:
 
 - A pull request that changes `.factory/` or the caller: `action: plan`, for a pull request opened from the host repository. A pull request from a fork is skipped, because it does not receive the passphrase secret.
-- A push to the host's `main` that changes those paths, and **Run workflow** from `main`: `action: apply`, then commit `.factory/state/terraform.tfstate` and push that commit to `main`.
+- A push to the host's default branch that changes those paths, and **Run workflow** from that branch: `action: apply`, then commit `.factory/state/terraform.tfstate` and push that commit to the same branch.
 
 The commit adds that path and nothing else. OpenTofu's `.terraform/` directory, plan files, and `terraform.tfstate.backup` stay untracked. The add is forced, so a host `.gitignore` entry of `*.tfstate*` does not drop the state file.
 
@@ -92,7 +92,7 @@ Do this before the first plan or apply.
 
    ```bash
    mkdir -p .factory
-   ref=main   # or a commit SHA
+   ref=main   # revision of this factory repository; a commit SHA pins it
    repo=TigranOhanyan/github-cursor-factory
    for f in terraform.tf variables.tf providers.tf labels.tf .terraform.lock.hcl; do
      curl -fsSL -o ".factory/$f" "https://raw.githubusercontent.com/$repo/$ref/$f"
@@ -112,7 +112,7 @@ Do this before the first plan or apply.
          - ".github/workflows/factory-labels.yml"
      push:
        branches:
-         - main
+         - "**"
        paths:
          - ".factory/**"
          - "!.factory/state/**"
@@ -131,8 +131,16 @@ Do this before the first plan or apply.
        secrets:
          state_passphrase: ${{ secrets.TF_STATE_PASSPHRASE }}
 
+     # Branch filters cannot use expressions, so push listens to every
+     # branch and this job keeps only the default one. A manual run does
+     # the same when the event includes repository.default_branch. The
+     # public workflow_dispatch payload does not list that field; if it
+     # is empty, this job still runs and labels.yml asks the API before
+     # it applies.
      apply:
-       if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+       if: >-
+         (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)
+         || (github.event_name == 'workflow_dispatch' && (!github.event.repository.default_branch || github.ref_name == github.event.repository.default_branch))
        permissions:
          contents: write
          issues: write
@@ -143,7 +151,7 @@ Do this before the first plan or apply.
          state_passphrase: ${{ secrets.TF_STATE_PASSPHRASE }}
    ```
 
-   Replace `@main` with a commit SHA to stay on a fixed revision of this repository. The example follows `main`.
+   `@main` in `uses` is a revision of this factory repository, not the host's default branch. Replace it with a commit SHA to pin that revision.
 
 3. Generate a passphrase of at least 16 characters:
 
@@ -153,14 +161,14 @@ Do this before the first plan or apply.
 
    Copy that single line, with no extra space and no extra newline. Store it in a password manager and in a second backup you can open if the password manager is lost. The passphrase is not in either repository. OpenTofu cannot reconstruct it. Keep the same value for as long as the state file exists. Replacing the secret with a different passphrase makes the existing file unreadable.
 
-   If the passphrase is lost, delete `.factory/state/terraform.tfstate` from the host's `main` and run the workflow again. The labels stay on GitHub. The GitHub provider looks a label up by name and updates it, so a new state file can be written without importing by hand.
+   If the passphrase is lost, delete `.factory/state/terraform.tfstate` from the host's default branch and run the workflow again. The labels stay on GitHub. The GitHub provider looks a label up by name and updates it, so a new state file can be written without importing by hand.
 
 4. In the host repository: **Settings → Secrets and variables → Actions → New repository secret**.
 
    - Name: `TF_STATE_PASSPHRASE`
    - Secret: the line from step 3
 
-5. Commit `.factory/` and `factory-labels.yml` to a pull request, or to `main`, after the secret exists. The pull request plans. The merge, or **Actions → Factory labels → Run workflow** on `main`, applies and creates the state file.
+5. Commit `.factory/` and `factory-labels.yml` to a pull request, or straight to the default branch, after the secret exists. The pull request plans. The merge, or **Actions → Factory labels → Run workflow** on the default branch, applies and creates the state file.
 
    You do not create the six labels by hand. If apply fails with a 403, the host's default token is read-only and the job permissions could not raise it. Set **Settings → Actions → General → Workflow permissions** to read and write, then re-run the workflow.
 
@@ -168,7 +176,7 @@ Do this before the first plan or apply.
 
 **OpenTofu, with state encryption.** The host commits its state file, so the file has to be encrypted. OpenTofu encrypts state and plan files itself, since version 1.7, with a PBKDF2 passphrase and AES-GCM. `enforced = true` refuses a plaintext state or plan. HashiCorp Terraform does not have that feature. OpenTofu is also open source under the MPL. The CLI in the workflows is pinned to 1.13.2, and the GitHub provider is pinned to 6.13.0.
 
-**The factory is source, not a project that applies.** The OpenTofu files live at the root of this repository. A host copies them into `.factory/`. The reusable workflow is `workflow_call` only, so a push here does not apply anything. State is the host's, on the host's `main`, at `.factory/state/terraform.tfstate`. The reasoning for this shape, including why this is not a template repository, is [ADR #3](https://github.com/TigranOhanyan/github-cursor-factory/issues/3).
+**The factory is source, not a project that applies.** The OpenTofu files live at the root of this repository. A host copies them into `.factory/`. The reusable workflow is `workflow_call` only, so a push here does not apply anything. State is the host's, on the host's default branch, at `.factory/state/terraform.tfstate`. The reasoning for this shape, including why this is not a template repository, is [ADR #3](https://github.com/TigranOhanyan/github-cursor-factory/issues/3).
 
 **Encrypted state in git.** The state file is small. It is stored in the host's git repository, encrypted, instead of in a remote backend such as S3 or HCP Terraform. A remote backend would be another account and another set of credentials. The passphrase is an Actions secret on that host.
 

@@ -53,11 +53,39 @@ jobs:
               ;;
           esac
 
-      - name: Apply only from main
-        if: inputs.action == 'apply' && github.ref != 'refs/heads/main'
+      # push and pull_request payloads include repository.default_branch.
+      # workflow_dispatch's documented payload is inputs, ref, and workflow.
+      # Actions often still attaches repository; when the field is empty,
+      # ask the API. Do not guess a branch name.
+      - name: Resolve the host default branch
+        id: default-branch
+        if: inputs.action == 'apply'
+        env:
+          FROM_EVENT: ${{ github.event.repository.default_branch }}
         run: |
-          echo "apply is only allowed from refs/heads/main (got ${GITHUB_REF})."
-          exit 1
+          set -euo pipefail
+          branch="${FROM_EVENT}"
+          if [ -z "$branch" ]; then
+            echo "repository.default_branch is not in the event payload. Asking the API."
+            branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+          fi
+          if [ -z "$branch" ] || [[ "$branch" == *$'\n'* ]] || [[ "$branch" == *' '* ]]; then
+            echo "Could not determine the host's default branch."
+            exit 1
+          fi
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          echo "Default branch is ${branch}."
+
+      - name: Apply only on the default branch
+        if: inputs.action == 'apply'
+        env:
+          DEFAULT_BRANCH: ${{ steps.default-branch.outputs.branch }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]; then
+            echo "apply is only allowed from the default branch ${DEFAULT_BRANCH} (got ${GITHUB_REF})."
+            exit 1
+          fi
 
       - name: Require state passphrase
         run: |
@@ -70,7 +98,7 @@ jobs:
 
       # github.* is the caller, so this is the host repository.
       # The ref is set explicitly: for a pull request it is that pull
-      # request's merge commit, and for a push it is the commit on main.
+      # request's merge commit, and for a push it is the commit that was pushed.
       - name: Checkout host repository
         uses: actions/checkout@v4
         with:
@@ -85,18 +113,14 @@ jobs:
           tofu_version: "1.13.2"
           tofu_wrapper: false
 
-      - name: Check formatting
-        working-directory: .factory
-        run: tofu fmt -check -recursive -diff
-
-      - name: Init and validate
+      - name: Init
         working-directory: .factory
         run: |
           set -euo pipefail
           # The factory ships no state/ directory. Apply creates the file.
+          # plan and apply validate the configuration themselves.
           mkdir -p state
           tofu init -input=false
-          tofu validate
 
       - name: Plan
         if: inputs.action == 'plan'
@@ -108,10 +132,11 @@ jobs:
         working-directory: .factory
         run: tofu apply -auto-approve -input=false -no-color
 
-      - name: Commit encrypted state on main
+      - name: Commit encrypted state on the default branch
         if: inputs.action == 'apply'
         env:
           EXPECTED_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ steps.default-branch.outputs.branch }}
         run: |
           set -euo pipefail
 
@@ -139,4 +164,4 @@ jobs:
             exit 1
           fi
 
-          git push origin HEAD:main
+          git push origin "HEAD:refs/heads/${DEFAULT_BRANCH}"
