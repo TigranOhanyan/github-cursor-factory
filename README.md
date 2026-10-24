@@ -2,7 +2,7 @@
 
 This repository is the start of a software factory. The idea is a pipeline where Cursor Automations do judgment work, such as building and reviewing, and GitHub Actions do deterministic work. It is built one step at a time, as code, and this README describes only what is in the repository.
 
-What is here today is OpenTofu that defines six issue labels, and a workflow file a host copies into its own `.github/workflows/` to plan and apply them. This factory repository does not run that workflow, and it has no state. How the factory is installed into a host is decided in [ADR: How the factory is distributed and laid out](https://github.com/TigranOhanyan/github-cursor-factory/issues/3).
+What is here today is OpenTofu that defines six issue labels, and `github/workflows/factory.yml`, which a host copies into its own `.github/workflows/` to plan and apply every `.tf` file in `.factory/`. This factory repository does not run that workflow, and it has no state. How the factory is installed into a host is decided in [ADR: How the factory is distributed and laid out](https://github.com/TigranOhanyan/github-cursor-factory/issues/3).
 
 ## Layout
 
@@ -14,7 +14,7 @@ variables.tf                              passphrase and the target repository
 providers.tf                              GitHub provider
 labels.tf                                 the six labels
 .terraform.lock.hcl                       provider checksums
-github/workflows/factory-labels.yml       copied to the host's .github/workflows/
+github/workflows/factory.yml              copied to the host's .github/workflows/
 .github/workflows/validate.yml            fmt, validate, and actionlint on pull requests here
 .gitignore                                this repository only; hosts do not copy it
 README.md                                 this repository only; hosts do not copy it
@@ -23,7 +23,7 @@ README.md                                 this repository only; hosts do not cop
 A host copies files like this:
 
 - Root files that are the stack go to `.factory/`. Today that is `terraform.tf`, `variables.tf`, `providers.tf`, `labels.tf`, and `.terraform.lock.hcl`.
-- `github/workflows/*` goes to the host's `.github/workflows/`. The `factory-` prefix keeps those files next to workflows the host wrote itself.
+- `github/workflows/*` goes to the host's `.github/workflows/`. The name `factory.yml` keeps it next to workflows the host wrote itself.
 - `.github/` is not copied. It is this repository's own CI.
 - Root files that belong to this repository as a project are not copied. Today those are `.gitignore` and `README.md`.
 
@@ -36,7 +36,7 @@ In a host repository that looks like:
 .factory/labels.tf
 .factory/.terraform.lock.hcl
 .factory/state/terraform.tfstate          written by apply, committed on the host's default branch
-.github/workflows/factory-labels.yml      copied from github/workflows/
+.github/workflows/factory.yml             copied from github/workflows/
 ```
 
 `state/` is reserved for that file. This repository ships nothing under `state/`. The backend path is `state/terraform.tfstate`, relative to the directory tofu runs in. The workflow runs tofu with `.factory/` as its working directory, so the committed path is `.factory/state/terraform.tfstate`.
@@ -46,7 +46,7 @@ Pull requests in this repository run `tofu fmt -check`, `tofu validate`, and [ac
 ```mermaid
 flowchart TD
   files["OpenTofu files at the factory root"] --> dotfactory["Host copies them into .factory/"]
-  wf["github/workflows/factory-labels.yml"] --> hostwf["Host copies it to .github/workflows/"]
+  wf["github/workflows/factory.yml"] --> hostwf["Host copies it to .github/workflows/"]
   hostwf --> pr["Pull request in the host"]
   hostwf --> push["Push to the host's default branch, or Run workflow"]
   pr --> plan["plan"]
@@ -73,7 +73,7 @@ These descriptions are written as facts that stay true. The intended use is to a
 
 ## How a host runs it
 
-`github/workflows/factory-labels.yml` does not run in this repository. After the copy it is `.github/workflows/factory-labels.yml` in the host, and that file is what runs:
+`github/workflows/factory.yml` does not run in this repository. A host copies it to `.github/workflows/factory.yml`, and that workflow plans and applies every `.tf` file in `.factory/`. It runs:
 
 - A pull request that changes `.factory/` or that workflow, opened from the host repository: plan. A pull request from a fork is skipped, because it does not receive the passphrase secret.
 - A push to the host's default branch that changes those paths, and **Run workflow** from that branch: apply, then commit `.factory/state/terraform.tfstate` and push that commit to the same branch.
@@ -84,13 +84,13 @@ The commit adds that path and nothing else. OpenTofu's `.terraform/` directory, 
 
 Two things keep that commit from running the workflow again. The path filters ignore `.factory/state/**`, so a commit that only touches the state file does not match. Separately, a push made with `GITHUB_TOKEN` does not start another workflow run.
 
-Plan and apply share one concurrency group per host, `factory-labels-<owner/name>`. An apply is not cancelled to make room for the next run, so two applies never overlap.
+Plan and apply share one concurrency group per host, `factory-<owner/name>`. An apply is not cancelled to make room for the next run, so two applies never overlap.
 
 Each job sets its own permissions. Plan uses `contents: read` and `issues: read`. Apply uses `contents: write` and `issues: write`.
 
 The workflow sets `TF_VAR_github_repository` from `github.repository` and `TF_VAR_state_passphrase` from the repository secret `TF_STATE_PASSPHRASE`. OpenTofu reads `TF_VAR_<name>`. The token is the host's `GITHUB_TOKEN`. No personal access token.
 
-Apply writes the state file again even when the labels did not change, because encryption uses a new nonce. The workflow commits it when the bytes differ. The file is JSON. Label names and ids sit inside `encrypted_data`. The diff is not a review of the labels.
+Apply writes the state file again even when the resources did not change, because encryption uses a new nonce. The workflow commits it when the bytes differ. The file is JSON. Resource names and ids sit inside `encrypted_data`. The diff is not a review of those resources.
 
 Run tofu through the workflow. `.factory/` has no `.gitignore`. If you run tofu by hand, you have to keep `.factory/.terraform/` out of git yourself, and the same for plan files and `terraform.tfstate.backup`. A local apply also rewrites the state file with whatever passphrase is in your shell.
 
@@ -108,7 +108,7 @@ Copying is by hand. A CLI for this install is not in this repository ([issue #2]
    for f in terraform.tf variables.tf providers.tf labels.tf .terraform.lock.hcl; do
      curl -fsSL -o ".factory/$f" "$base/$f"
    done
-   curl -fsSL -o .github/workflows/factory-labels.yml "$base/github/workflows/factory-labels.yml"
+   curl -fsSL -o .github/workflows/factory.yml "$base/github/workflows/factory.yml"
    ```
 
 2. Generate a passphrase of at least 16 characters:
@@ -126,7 +126,7 @@ Copying is by hand. A CLI for this install is not in this repository ([issue #2]
    - Name: `TF_STATE_PASSPHRASE`
    - Secret: the line from step 2
 
-4. Commit `.factory/` and `.github/workflows/factory-labels.yml` to a pull request, or straight to the default branch, after the secret exists. The pull request plans. The merge, or **Actions → Factory labels → Run workflow** on the default branch, applies and creates the state file.
+4. Commit `.factory/` and `.github/workflows/factory.yml` to a pull request, or straight to the default branch, after the secret exists. The pull request plans. The merge, or **Actions → Factory → Run workflow** on the default branch, applies and creates the state file.
 
    You do not create the six labels by hand. If apply fails with a 403, the host's default token is read-only and the job permissions could not raise it. Set **Settings → Actions → General → Workflow permissions** to read and write, then re-run the workflow.
 

@@ -1,24 +1,25 @@
-# Host workflow for the issue-label stack.
+# Host workflow for every .tf file in .factory/.
 #
 # This file lives under github/ (no dot) so Actions does not run it in
-# the factory. A host copies it to .github/workflows/factory-labels.yml,
-# and there it is that repository's own workflow. The factory- prefix
-# keeps it next to workflows the host wrote itself.
+# the factory. A host copies it to .github/workflows/factory.yml, and
+# there it is that repository's own workflow. The name factory.yml keeps
+# it next to workflows the host wrote itself.
 #
 # Paths below are host paths, after that copy. OpenTofu runs with
-# .factory/ as its working directory.
+# .factory/ as its working directory, so plan and apply cover every .tf
+# file copied there.
 #
 # The passphrase is the host secret TF_STATE_PASSPHRASE. The token is
 # the host's GITHUB_TOKEN. There is no personal access token.
 
-name: Factory labels
+name: Factory
 
 on:
   pull_request:
     paths:
       - ".factory/**"
       - "!.factory/state/**"
-      - ".github/workflows/factory-labels.yml"
+      - ".github/workflows/factory.yml"
   push:
     # A branches filter cannot use an expression, so this listens to
     # every branch. The apply job keeps only the default branch.
@@ -27,13 +28,13 @@ on:
     paths:
       - ".factory/**"
       - "!.factory/state/**"
-      - ".github/workflows/factory-labels.yml"
+      - ".github/workflows/factory.yml"
   workflow_dispatch:
 
 # One queue per host, shared by plan and apply. An apply is not cancelled
 # to make room for the next run.
 concurrency:
-  group: factory-labels-${{ github.repository }}
+  group: factory-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -190,7 +191,7 @@ jobs:
 
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -m "Update encrypted OpenTofu state for issue labels"
+              commit -m "Update encrypted OpenTofu state"
 
           # The new commit's parent is the commit this job checked out.
           parent="$(git rev-parse HEAD^)"
