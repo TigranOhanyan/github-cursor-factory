@@ -2,7 +2,7 @@
 
 This repository is the start of a software factory. The idea is a pipeline where Cursor Automations do judgment work, such as building and reviewing, and GitHub Actions do deterministic work. It is built one step at a time, as code, and this README describes only what is in the repository.
 
-What is here today is OpenTofu that defines six issue labels, two host workflows, and three GitHub App manifests. `github/workflows/factory.yml` is what a host copies into its own `.github/workflows/` to plan and apply every `.tf` file in `.factory/`. `github/workflows/merge.yml` is copied the same way and merges a pull request when the configured reviewers have approved its head commit and checks have succeeded. `apps/` is the reference for creating those GitHub Apps by hand. This factory repository does not run the host workflows, and it has no state. How the factory is installed into a host is decided in [ADR: How the factory is distributed and laid out](https://github.com/TigranOhanyan/github-cursor-factory/issues/3).
+What is here today is OpenTofu that defines six issue labels, three host workflows, and three GitHub App manifests. `github/workflows/factory.yml` is what a host copies into its own `.github/workflows/` to plan and apply every `.tf` file in `.factory/`. `github/workflows/build.yml` is copied the same way and, every 10 minutes, runs `gh gcf build`, which claims open issues labeled `todo` and starts a Cursor cloud agent for each. `github/workflows/merge.yml` is copied the same way and merges a pull request when the configured reviewers have approved its head commit and checks have succeeded. `apps/` is the reference for creating those GitHub Apps by hand. This factory repository does not run the host workflows, and it has no state. How the factory is installed into a host is decided in [ADR: How the factory is distributed and laid out](https://github.com/TigranOhanyan/github-cursor-factory/issues/3).
 
 ## Layout
 
@@ -18,6 +18,7 @@ apps/factory.json                         GitHub App manifest, gcf-factory
 apps/reviewer-1.json                      GitHub App manifest, gcf-reviewer-1
 apps/reviewer-2.json                      GitHub App manifest, gcf-reviewer-2
 github/workflows/factory.yml              copied to the host's .github/workflows/
+github/workflows/build.yml                copied to the host's .github/workflows/
 github/workflows/merge.yml                copied to the host's .github/workflows/
 .github/workflows/validate.yml            fmt, validate, actionlint, and merge fixtures on pull requests here
 tests/merge_fixtures.py                   factory checks of the merge rules
@@ -28,7 +29,7 @@ README.md                                 this repository only; hosts do not cop
 A host copies files like this:
 
 - Root files that are the stack go to `.factory/`. Today that is `terraform.tf`, `variables.tf`, `providers.tf`, `labels.tf`, and `.terraform.lock.hcl`.
-- `github/workflows/*` goes to the host's `.github/workflows/`. The names `factory.yml` and `merge.yml` stay as they are, next to workflows the host wrote itself.
+- `github/workflows/*` goes to the host's `.github/workflows/`. The names `factory.yml`, `build.yml`, and `merge.yml` stay as they are, next to workflows the host wrote itself. [`gh gcf pull`](https://github.com/TigranOhanyan/gh-gcf) copies that directory by this rule: every file under `github/workflows/` is installed at the same name under the host's `.github/workflows/`.
 - `.github/` is not copied. It is this repository's own CI.
 - Root files that belong to this repository as a project are not copied. Today those are `.gitignore`, `README.md`, `apps/`, and `tests/`. The manifests are how a person creates the GitHub Apps. A host does not vendor the JSON. The fixture checks run in this repository's CI.
 
@@ -42,6 +43,7 @@ In a host repository that looks like:
 .factory/.terraform.lock.hcl
 .factory/state/terraform.tfstate          written by apply, committed on the host's default branch
 .github/workflows/factory.yml             copied from github/workflows/
+.github/workflows/build.yml               copied from github/workflows/
 .github/workflows/merge.yml               copied from github/workflows/
 ```
 
@@ -53,13 +55,17 @@ Pull requests in this repository run `tofu fmt -check`, `tofu validate`, and [ac
 flowchart TD
   files["OpenTofu files at the factory root"] --> dotfactory["Host copies them into .factory/"]
   wf["github/workflows/factory.yml"] --> hostwf["Host copies it to .github/workflows/"]
+  build["github/workflows/build.yml"] --> hostbuild["Host copies it to .github/workflows/"]
   merge["github/workflows/merge.yml"] --> hostmerge["Host copies it to .github/workflows/"]
   hostwf --> pr["Pull request in the host"]
   hostwf --> push["Push to the host's default branch, or Run workflow"]
   pr --> plan["plan"]
   push --> apply["apply"]
   apply --> state["Commit .factory/state/terraform.tfstate on the default branch"]
-  hostmerge --> gate["Listed reviewers approved the head SHA, and checks succeeded"]
+  hostbuild --> tick["Every 10 minutes, or Run workflow"]
+  tick --> opened["Pull request under the key owner's account"]
+  opened --> gate["Listed reviewers approved the head SHA, and checks succeeded"]
+  hostmerge --> gate
   gate --> mcommit["Merge commit by the gcf-factory app"]
   mcommit --> push
 ```
@@ -118,6 +124,24 @@ Apply writes the state file again even when the resources did not change, becaus
 
 Run tofu through the workflow. `.factory/` has no `.gitignore`. If you run tofu by hand, you have to keep `.factory/.terraform/` out of git yourself, and the same for plan files and `terraform.tfstate.backup`. A local apply also rewrites the state file with whatever passphrase is in your shell.
 
+## Building an issue
+
+`github/workflows/build.yml` does not run in this repository. A host copies it to `.github/workflows/build.yml`. `gh gcf pull` copies it with the other files under `github/workflows/`. The workflow name is Factory build.
+
+It runs every 10 minutes, on the schedule `*/10 * * * *`, and when someone uses **Run workflow**. GitHub evaluates that schedule in UTC. It can start the run late when Actions is busy. In a public repository, GitHub disables the schedule after 60 days without activity. [Merging a pull request](#merging-a-pull-request) describes those same limits for Factory merge, including that a schedule starts only when the workflow file is on the default branch.
+
+Runs share the concurrency group `factory-build`. The in-progress run is not cancelled. The next run waits until the current one finishes, so two runs do not claim the same issue.
+
+The job permissions are `contents: read` and `issues: write`. `gh` uses the host's `GITHUB_TOKEN` as `GH_TOKEN`.
+
+Each run installs [`gh-gcf`](https://github.com/TigranOhanyan/gh-gcf) with `gh extension install TigranOhanyan/gh-gcf --pin`. The tag is `GH_GCF_VERSION` at the top of the workflow file, `v0.2.0`. The job then runs `gh gcf build --repo` for the host repository. That command finds open issues labeled `todo` that do not have `in-progress` or `needs-attention`, adds `in-progress`, and starts a Cursor cloud agent for each one. There is no checkout. The command uses the GitHub API and the Cursor API. If that pinned release cannot be installed, or `gh gcf build` exits non-zero, the workflow fails. The failed run shows on the Actions tab.
+
+`CURSOR_API_KEY` is a repository secret: a user API key from the [Cursor API keys page](https://cursor.com/dashboard/api). The cloud agent opens the pull request under the GitHub account that owns that key. The workflow does not print the key. When the secret is missing or empty, the job writes a notice and the run succeeds, so a host that has not created it does not fail every 10 minutes.
+
+`GCF_BUILDER_MODEL` is an optional repository variable. When it is set, the workflow passes it to `gh gcf build` as the environment variable of the same name. When it is unset or empty, the workflow leaves that variable unset.
+
+A person merges the pull request the agent opened. Factory merge, in the next section, applies its own rules to that pull request.
+
 ## Merging a pull request
 
 `github/workflows/merge.yml` does not run in this repository. A host copies it to `.github/workflows/merge.yml`. The workflow name is Factory merge. It runs when:
@@ -171,6 +195,7 @@ Copying is by hand. A CLI for this install is not in this repository ([issue #2]
      curl -fsSL -o ".factory/$f" "$base/$f"
    done
    curl -fsSL -o .github/workflows/factory.yml "$base/github/workflows/factory.yml"
+   curl -fsSL -o .github/workflows/build.yml "$base/github/workflows/build.yml"
    curl -fsSL -o .github/workflows/merge.yml "$base/github/workflows/merge.yml"
    ```
 
@@ -189,11 +214,31 @@ Copying is by hand. A CLI for this install is not in this repository ([issue #2]
    - Name: `TF_STATE_PASSPHRASE`
    - Secret: the line from step 2
 
-4. Commit `.factory/`, `.github/workflows/factory.yml`, and `.github/workflows/merge.yml` to a pull request, or straight to the default branch, after the secret exists. The pull request plans. The merge, or **Actions → Factory → Run workflow** on the default branch, applies and creates the state file.
+4. Commit `.factory/`, `.github/workflows/factory.yml`, `.github/workflows/build.yml`, and `.github/workflows/merge.yml` to a pull request, or straight to the default branch, after the secret exists. The pull request plans. The merge, or **Actions → Factory → Run workflow** on the default branch, applies and creates the state file.
 
    You do not create the six labels by hand. If apply fails with a 403, the host's default token is read-only and the job permissions could not raise it. Set **Settings → Actions → General → Workflow permissions** to read and write, then re-run the workflow.
 
 `merge.yml` needs the apps below before it can merge. Until those secrets exist, a run of Factory merge fails at the token step.
+
+## Manual setup for the builder
+
+Do this on the host before Factory build should claim issues. Until `CURSOR_API_KEY` exists, a run of Factory build writes a notice and does no work.
+
+1. Create a user API key at [https://cursor.com/dashboard/api](https://cursor.com/dashboard/api). Pull requests open under the GitHub account that owns this key.
+
+2. In the host repository: **Settings → Secrets and variables → Actions → New repository secret**.
+
+   - Name: `CURSOR_API_KEY`
+   - Secret: the API key
+
+3. Optional. **Settings → Secrets and variables → Actions → Variables → New repository variable**.
+
+   - Name: `GCF_BUILDER_MODEL`
+   - Value: the model name passed to `gh gcf build`
+
+   Leave the variable unset. The workflow leaves `GCF_BUILDER_MODEL` unset.
+
+`build.yml` has to be on the host's default branch before the 10-minute schedule starts. **Actions → Factory build → Run workflow** runs the same job from the branch you select.
 
 ## Manual setup for the apps
 
@@ -233,3 +278,5 @@ Create the apps before Factory merge is expected to merge a pull request. The JS
 **The merger counts reviews itself.** It reads the review list, check runs, and commit statuses. It does not use GitHub's combined review decision. Each listed login contributes at most one review, the latest formal one, and that review counts only when it approves the current head SHA. A comment does not count and does not replace an approval. The login list can name an app's bot or a person. The workflow's own check runs are left out of the check total. When `FACTORY_REQUIRED_APPROVALS` is unset, the minimum is the number of listed logins. When `FACTORY_REQUIRED_CHECKS` is set, each listed name has to be present and successful. Unmet conditions leave the pull request open and the run succeeds. One pull request that cannot be read or merged does not stop the others. The run fails at the end if any of those attempts failed. A pull request that is already merged is a success.
 
 **The schedule covers checks that finish last.** `check_suite` does not start this workflow for a suite GitHub Actions created, so a pull request that is approved before its checks finish would not be merged by that event. Every 10 minutes the workflow reads every open, non-draft pull request from the host repository, on any base branch, and applies the same rules. The scheduled run has its own concurrency group. GitHub runs that schedule only from the workflow file on the default branch, can delay it when Actions is busy, and disables it in a public repository after 60 days without activity.
+
+**A scheduled build claims issues and starts a cloud agent.** `build.yml` runs `gh gcf build` from the [gh-gcf](https://github.com/TigranOhanyan/gh-gcf) extension, pinned to `v0.2.0`. The command adds `in-progress` to each open `todo` issue that does not already have `in-progress` or `needs-attention`, and starts a Cursor cloud agent. The agent opens the pull request under the GitHub account that owns `CURSOR_API_KEY`. Runs share the concurrency group `factory-build` and do not cancel each other. A missing key ends the run successfully. A failed build fails the run.
