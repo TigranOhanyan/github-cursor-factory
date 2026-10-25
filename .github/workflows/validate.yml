@@ -1,6 +1,7 @@
 # Pull requests in the factory repository.
 # fmt and validate the OpenTofu here. actionlint checks .github/workflows
-# and github/workflows. There is no backend and no state: this repo never applies.
+# and github/workflows. tests/merge_fixtures.py checks the merge rules.
+# There is no backend and no state: this repo never applies.
 
 name: Validate
 
@@ -67,3 +68,6 @@ jobs:
           curl -fsSL -o "${tmp}/${archive}" "https://github.com/rhysd/actionlint/releases/download/v${version}/${archive}"
           tar -xzf "${tmp}/${archive}" -C "$tmp" actionlint
           "$tmp/actionlint" -color .github/workflows/*.yml github/workflows/*.yml
+
+      - name: Check merge fixtures
+        run: python3 tests/merge_fixtures.py
