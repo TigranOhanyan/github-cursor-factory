@@ -1,0 +1,281 @@
+# Host workflow that merges a pull request once the configured reviewers
+# have approved its head commit and every other check is green.
+#
+# This file lives under github/ (no dot) so Actions does not run it in
+# the factory. A host copies it to .github/workflows/merge.yml, and
+# there it is that repository's own workflow.
+#
+# The merge is gh pr merge --merge with the gcf-factory app token.
+# A push made with the job's GITHUB_TOKEN does not start other
+# workflows. The app token does, so the merge commit can start the
+# host's factory.yml. The token comes from actions/create-github-app-token
+# and the secrets FACTORY_APP_ID and FACTORY_APP_PRIVATE_KEY.
+#
+# There is no checkout. The decision is read from the API, and the
+# merge is the gh command. The merge commit lands on the pull request's
+# base branch, whichever name that branch has.
+
+name: Factory merge
+
+on:
+  pull_request_review:
+    types: [submitted]
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+  check_suite:
+    types: [completed]
+  workflow_dispatch:
+
+# One group per pull request. A later event waits, then evaluates
+# again. cancel-in-progress would drop a merge that is already in flight.
+# check_suite carries the pull request on the suite, not on
+# pull_request. workflow_dispatch has neither, so it uses the ref of
+# the branch the run was started from.
+concurrency:
+  group: factory-merge-${{ github.event.pull_request.number || github.event.check_suite.pull_requests[0].number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Factory merge
+    # Fork pull requests do not receive the app secrets. Skip them
+    # before minting a token. Drafts are skipped here too.
+    # check_suite and workflow_dispatch can name a fork or a draft
+    # only after the API read, so the script checks those again.
+    if: >-
+      github.event_name == 'check_suite'
+      || github.event_name == 'workflow_dispatch'
+      || (
+        github.event.pull_request.head.repo.full_name == github.repository
+        && github.event.pull_request.draft == false
+      )
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.FACTORY_APP_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+
+      - name: Merge when approvals and checks allow it
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          FACTORY_REQUIRED_APPROVALS: ${{ vars.FACTORY_REQUIRED_APPROVALS }}
+          FACTORY_REVIEWER_LOGINS: ${{ vars.FACTORY_REVIEWER_LOGINS }}
+        run: |
+          set -euo pipefail
+
+          # Unset or blank means 2. A value that is not a non-negative
+          # integer cannot be met, and that still ends the run successfully.
+          required="${FACTORY_REQUIRED_APPROVALS:-}"
+          required="${required#"${required%%[![:space:]]*}"}"
+          required="${required%"${required##*[![:space:]]}"}"
+          if [ -z "$required" ]; then
+            required=2
+          fi
+          if ! [[ "$required" =~ ^[0-9]+$ ]]; then
+            echo "FACTORY_REQUIRED_APPROVALS is not a non-negative integer (${required}). Not merging."
+            exit 0
+          fi
+
+          # Comma-separated. Spaces around commas are ignored.
+          # Example: gcf-reviewer-1[bot],gcf-reviewer-2[bot]
+          allow_json="$(printf '%s' "${FACTORY_REVIEWER_LOGINS:-}" | jq -Rsc '
+            split(",")
+            | map(gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0))
+          ')"
+
+          # Latest formal review per login. COMMENTED and PENDING are
+          # not formal, so a later comment does not replace an approval.
+          # CHANGES_REQUESTED and DISMISSED do. An APPROVED review counts
+          # only when that latest formal review is APPROVED, its author
+          # is in the list, and commit_id is the pull request head.
+          approvals_filter="$(cat <<'EOF'
+          [
+            $reviews[]
+            | select(.user != null and .user.login != null)
+            | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+          ]
+          | group_by(.user.login)
+          | map(sort_by(.submitted_at // "", .id // 0) | last)
+          | map(select(
+              .state == "APPROVED"
+              and .commit_id == $head
+              and (.user.login as $login | any($allow[]; . == $login))
+            ))
+          | {count: length, counted: [.[].user.login] | sort}
+          EOF
+          )"
+
+          # The app has checks: read, not Actions read, so a check run
+          # cannot be joined to a workflow file. This job's check run is
+          # named "Factory merge", the same as the workflow. Those runs,
+          # and any check whose URL is this Actions run, are excluded.
+          # Latest run per app and name wins, so an older failure does
+          # not outvote a newer success.
+          #
+          # success, skipped, and neutral are complete. Factory's apply
+          # job is skipped on a pull request; that is not a failure.
+          # Anything else blocks, including a check that is still running.
+          # Commit statuses have no skipped state. The latest status per
+          # context must be success. No statuses means nothing to wait for.
+          checks_filter="$(cat <<'EOF'
+          def own:
+            (
+              .name == $job_name
+              and ((.app.slug // "") == "github-actions")
+            )
+            or ((.details_url // "") | contains("/actions/runs/" + $run_id + "/"));
+          def check_ok:
+            .status == "completed"
+            and (
+              .conclusion == "success"
+              or .conclusion == "skipped"
+              or .conclusion == "neutral"
+            );
+          ([
+            $checks[]
+            | select(own | not)
+            | select((.name // "") != "")
+          ]
+          | group_by((.app.slug // "") + "\u0000" + .name)
+          | map(sort_by(.started_at // "", .id // 0) | last)
+          ) as $latest_checks
+          | ([
+            $statuses[]
+            | select((.context // "") != "")
+          ]
+          | group_by(.context)
+          | map(sort_by(.updated_at // .created_at // "", .id // 0) | last)
+          ) as $latest_statuses
+          | {
+              kept_checks: ($latest_checks | length),
+              status_contexts: ($latest_statuses | length),
+              blocking_checks: [
+                $latest_checks[]
+                | select(check_ok | not)
+                | {name, status, conclusion: (.conclusion // "none"), app: (.app.slug // null)}
+              ],
+              blocking_statuses: [
+                $latest_statuses[]
+                | select(.state != "success")
+                | {context, state}
+              ]
+            }
+          EOF
+          )"
+
+          collect_pr_numbers() {
+            case "$GITHUB_EVENT_NAME" in
+              pull_request|pull_request_review)
+                jq -r '.pull_request.number? // empty' "$GITHUB_EVENT_PATH"
+                ;;
+              check_suite)
+                # One suite can list several pull requests. Each is evaluated.
+                jq -r '(.check_suite.pull_requests // [])[] | .number? // empty' "$GITHUB_EVENT_PATH"
+                ;;
+              workflow_dispatch)
+                # The branch chosen for Run workflow. Its name is not assumed.
+                gh pr list \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --state open \
+                  --head "$GITHUB_REF_NAME" \
+                  --limit 100 \
+                  --json number \
+                  --jq '.[].number'
+                ;;
+              *)
+                return 0
+                ;;
+            esac
+          }
+
+          evaluate_pr() {
+            local number="$1"
+            local pr_json draft state head_sha head_repo
+            local reviews_json approval_json counted_text count
+            local checks_json statuses_json report blocking
+
+            pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}")"
+            draft="$(jq -r '.draft' <<<"$pr_json")"
+            state="$(jq -r '.state' <<<"$pr_json")"
+            head_sha="$(jq -r '.head.sha // empty' <<<"$pr_json")"
+            head_repo="$(jq -r '.head.repo.full_name // empty' <<<"$pr_json")"
+
+            echo "Pull request #${number}: state=${state} draft=${draft} head=${head_sha:-none} head_repo=${head_repo:-none}."
+
+            if [ "$state" != "open" ]; then
+              echo "Pull request #${number} is ${state}. Not merging."
+              return 0
+            fi
+            if [ "$draft" != "false" ]; then
+              echo "Pull request #${number} is a draft. Not merging."
+              return 0
+            fi
+            if [ -z "$head_repo" ] || [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+              echo "Pull request #${number} is from another repository. Not merging."
+              return 0
+            fi
+            if ! [[ "$head_sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "Pull request #${number} has no head SHA. Not merging."
+              return 0
+            fi
+
+            reviews_json="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${number}/reviews" | jq 'add // []')"
+            approval_json="$(jq -n \
+              --argjson reviews "$reviews_json" \
+              --argjson allow "$allow_json" \
+              --arg head "$head_sha" \
+              "$approvals_filter")"
+            count="$(jq -r '.count' <<<"$approval_json")"
+            counted_text="$(jq -r 'if (.counted | length) == 0 then "none" else (.counted | join(", ")) end' <<<"$approval_json")"
+            echo "Approvals on ${head_sha}: ${count} of ${required} (${counted_text})."
+
+            checks_json="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/check-runs?per_page=100&filter=all" | jq '[.[] | .check_runs[]?]')"
+            statuses_json="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/statuses?per_page=100" | jq 'add // []')"
+            report="$(jq -n \
+              --argjson checks "$checks_json" \
+              --argjson statuses "$statuses_json" \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg job_name "Factory merge" \
+              "$checks_filter")"
+            echo "Check runs considered: $(jq -r '.kept_checks' <<<"$report"). Commit status contexts: $(jq -r '.status_contexts' <<<"$report")."
+            jq -r '.blocking_checks[] | "check \(.name): status=\(.status) conclusion=\(.conclusion) app=\(.app // "none")"' <<<"$report"
+            jq -r '.blocking_statuses[] | "status \(.context): \(.state)"' <<<"$report"
+
+            blocking="$(jq -r '(.blocking_checks | length) + (.blocking_statuses | length)' <<<"$report")"
+            if [ "$count" -lt "$required" ] || [ "$blocking" -gt 0 ]; then
+              echo "Pull request #${number} does not meet the merge conditions. Not merging."
+              return 0
+            fi
+
+            # --match-head-commit refuses the merge if the head moved
+            # after this read. The newer head is a later event.
+            echo "Merging pull request #${number} at ${head_sha} with a merge commit."
+            if ! gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --merge --match-head-commit "$head_sha"; then
+              echo "GitHub refused to merge pull request #${number}."
+              return 1
+            fi
+          }
+
+          echo "Event ${GITHUB_EVENT_NAME}. Required approvals: ${required}. Reviewer logins: ${allow_json}."
+
+          pr_file="$(mktemp)"
+          collect_pr_numbers > "$pr_file"
+          mapfile -t pr_numbers < <(awk '/^[0-9]+$/ { print }' "$pr_file" | sort -u)
+
+          if [ "${#pr_numbers[@]}" -eq 0 ]; then
+            echo "No pull request to evaluate. Not merging."
+            exit 0
+          fi
+
+          for number in "${pr_numbers[@]}"; do
+            evaluate_pr "$number"
+          done
